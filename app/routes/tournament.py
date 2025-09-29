@@ -575,7 +575,7 @@ async def submit_tournament_answer(
         
         # Process through the AI workflow (same as main game)
         print(f"Invoking AI workflow with game_state: {game_state}")
-        result = tournament_game_app.invoke(game_state)
+        result = tournament_game_app(game_state)
         print(f"AI workflow result: {result}")
         
         # Update session data with new state

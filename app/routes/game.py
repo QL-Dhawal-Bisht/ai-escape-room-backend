@@ -288,7 +288,7 @@ async def send_message(
         )
 
         # Process through game workflow
-        result = game_app.invoke(state)
+        result = game_app(state)
 
         # Update session in database
         cursor.execute("""

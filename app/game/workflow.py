@@ -1,7 +1,7 @@
 import random
 import os
-from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END
+import asyncio
+from openai import OpenAI
 
 from app.models.game_state import GameState
 from app.game.stages import STAGES
@@ -107,13 +107,7 @@ def character_ai_node(state: GameState):
                 }
 
     try:
-        llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.8,  # Increased for more variability
-            max_tokens=150,
-            max_retries=2,
-            api_key=os.getenv("OPENAI_API_KEY"),
-        )
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
         # Build enhanced prompt with user-specific security
         base_prompt = build_dynamic_prompt(stage_config, state["character_mood"], state["resistance_level"])
@@ -130,8 +124,13 @@ def character_ai_node(state: GameState):
 
         messages.append({"role": "user", "content": user_input})
 
-        response = llm.invoke(messages)
-        bot_response = response.content.strip()
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.8,
+            max_tokens=150,
+        )
+        bot_response = response.choices[0].message.content.strip()
 
         # Apply glitch effects for stage 3
         if stage == 3 and random.random() < 0.4:  # 40% chance of glitch
@@ -322,15 +321,19 @@ def story_update_node(state: GameState):
 
 
 def create_game_workflow():
-    """Create and return the game workflow"""
-    workflow = StateGraph(GameState)
-    workflow.add_node("character_ai", character_ai_node)
-    workflow.add_node("validate_keys", validate_keys_node)
-    workflow.add_node("story_update", story_update_node)
+    """Create and return the game workflow (simplified without LangGraph)"""
 
-    workflow.add_edge("character_ai", "validate_keys")
-    workflow.add_edge("validate_keys", "story_update")
-    workflow.add_edge("story_update", END)
-    workflow.set_entry_point("character_ai")
+    def process_game_turn(state: GameState) -> GameState:
+        """Process a complete game turn through all nodes"""
+        # Step 1: Character AI response
+        state = character_ai_node(state)
 
-    return workflow.compile()
+        # Step 2: Validate keys
+        state = validate_keys_node(state)
+
+        # Step 3: Update story/progression
+        state = story_update_node(state)
+
+        return state
+
+    return process_game_turn
