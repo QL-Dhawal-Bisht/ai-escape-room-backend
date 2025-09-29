@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: ai-escape-room-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # Environment variables should be set in Render dashboard
+    # Do not include actual secrets in this file
+    envVars:
+      - key: OPENAI_API_KEY
+        value: your_openai_api_key_here
+      - key: SECRET_KEY
+        value: your_secret_key_here
+      - key: MONGODB_URL
+        value: your_mongodb_connection_string_here
+      - key: USE_MONGODB
+        value: true
+      - key: ENVIRONMENT
+        value: production

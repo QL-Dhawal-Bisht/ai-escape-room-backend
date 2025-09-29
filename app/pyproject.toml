@@ -1,0 +1,22 @@
+[project]
+name = "app"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.104.1",
+    "langchain-groq==0.1.0",
+    "langchain-openai>=0.1.7",
+    "langgraph==0.0.40",
+    "openai>=1.109.1",
+    "passlib>=1.7.4",
+    "psycopg2-binary>=2.9.10",
+    "pydantic==2.5.0",
+    "pyjwt==2.8.0",
+    "python-dotenv==1.0.0",
+    "python-jose[cryptography]==3.3.0",
+    "python-multipart==0.0.6",
+    "sqlalchemy>=2.0.43",
+    "uvicorn[standard]==0.24.0",
+]
