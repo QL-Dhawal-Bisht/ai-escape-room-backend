@@ -1,5 +1,6 @@
 import hashlib
-from jose import jwt, JWTError
+import jwt
+from jwt.exceptions import InvalidTokenError
 from datetime import datetime, timedelta
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -31,5 +32,5 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         if username is None:
             raise HTTPException(status_code=401, detail="Invalid authentication credentials")
         return username
-    except JWTError:
+    except InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
