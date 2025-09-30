@@ -1,20 +1,10 @@
 from fastapi import APIRouter, HTTPException, Depends
-from passlib.context import CryptContext
 
 from app.models.schemas import UserRegister, UserLogin
 from app.database.mongodb import create_user, get_user_by_username, get_user_by_email
-from app.auth.auth import create_access_token, get_current_user
+from app.auth.auth import create_access_token, get_current_user, hash_password, verify_password
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
-
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
 
 
 @router.post("/register")
