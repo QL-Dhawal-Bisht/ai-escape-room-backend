@@ -1,10 +1,11 @@
 from fastapi import APIRouter, HTTPException, Depends
 import json
 import uuid
+from datetime import datetime
 
 from app.models.schemas import MessageRequest, GameResponse
 from app.models.game_state import GameState
-from app.database.connection import get_db
+from app.database.mongodb import get_user_by_username, create_game_session, get_game_session, update_game_session, get_database
 from app.auth.auth import get_current_user
 from app.game.stages import STAGES
 from app.game.workflow import create_game_workflow
@@ -33,33 +34,26 @@ async def get_stage_hints(stage: int, current_user: str = Depends(get_current_us
 
 @router.post("/start")
 async def start_game(current_user: str = Depends(get_current_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-
     try:
-        # Get user ID
-        cursor.execute("SELECT id FROM users WHERE username = ?", (current_user,))
-        user = cursor.fetchone()
+        # Get user
+        user = await get_user_by_username(current_user)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
         user_id = user["id"]
+        db = get_database()
 
         # Check for existing incomplete session
-        cursor.execute("""
-            SELECT * FROM game_sessions
-            WHERE user_id = ? AND game_over = FALSE
-            ORDER BY updated_at DESC
-            LIMIT 1
-        """, (user_id,))
-
-        existing_session = cursor.fetchone()
+        existing_session = await db.game_sessions.find_one({
+            "user_id": user_id,
+            "game_over": False
+        }, sort=[("updated_at", -1)])
 
         if existing_session:
             # Resume existing session
             session_id = existing_session["id"]
             stage = existing_session["stage"]
-            extracted_keys = json.loads(existing_session["extracted_keys"])
+            extracted_keys = existing_session.get("extracted_keys", [])
             stage_config = STAGES[stage]
 
             # Count keys found in current stage only
@@ -72,12 +66,12 @@ async def start_game(current_user: str = Depends(get_current_user)):
                 session_id=session_id,
                 stage=stage,
                 character=stage_config["character"],
-                character_mood=existing_session["character_mood"],
-                bot_response=f"Welcome back to the AI Escape Room! \n\nResuming Stage {stage}: {stage_config['character']}\n\n{stage_config['instructions']}\n\n📊 Progress: {len(current_stage_keys_found)}/{len(stage_config['keys'])} keys found\n\n{stage_config['moods'][existing_session['character_mood']]}",
+                character_mood=existing_session.get("character_mood", "helpful"),
+                bot_response=f"Welcome back to the AI Escape Room! \n\nResuming Stage {stage}: {stage_config['character']}\n\n{stage_config['instructions']}\n\n📊 Progress: {len(current_stage_keys_found)}/{len(stage_config['keys'])} keys found\n\n{stage_config['moods'][existing_session.get('character_mood', 'helpful')]}",
                 extracted_keys=current_stage_keys_found,  # Show only current stage keys in UI
-                score=existing_session["score"],
-                attempts=existing_session["attempts"],
-                resistance_level=existing_session["resistance_level"],
+                score=existing_session.get("score", 0),
+                attempts=existing_session.get("attempts", 0),
+                resistance_level=existing_session.get("resistance_level", 1),
                 stage_complete=len(current_stage_keys_found) == len(stage_config["keys"]),
                 game_over=False,
                 total_keys_in_stage=len(stage_config["keys"]),
@@ -87,11 +81,23 @@ async def start_game(current_user: str = Depends(get_current_user)):
         else:
             # Create new game session
             session_id = str(uuid.uuid4())
-            cursor.execute("""
-                INSERT INTO game_sessions (id, user_id) VALUES (?, ?)
-            """, (session_id, user_id))
+            session_data = {
+                "id": session_id,
+                "user_id": user_id,
+                "stage": 1,
+                "score": 0,
+                "attempts": 0,
+                "extracted_keys": [],
+                "conversation_history": [],
+                "character_mood": "helpful",
+                "resistance_level": 1,
+                "failed_attempts": 0,
+                "game_over": False,
+                "success": False,
+                "new_stage_start": True
+            }
 
-            conn.commit()
+            await db.game_sessions.insert_one(session_data)
 
             # Get initial stage info
             stage_config = STAGES[1]
@@ -112,42 +118,51 @@ async def start_game(current_user: str = Depends(get_current_user)):
                 keys_found_in_stage=0
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
 
 
 @router.post("/start/fresh")
 async def start_fresh_game(current_user: str = Depends(get_current_user)):
     """Start a completely fresh game, deleting all existing progress"""
-    conn = get_db()
-    cursor = conn.cursor()
-
     try:
-        # Get user ID
-        cursor.execute("SELECT id FROM users WHERE username = ?", (current_user,))
-        user = cursor.fetchone()
+        # Get user
+        user = await get_user_by_username(current_user)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
         user_id = user["id"]
+        db = get_database()
 
         # End any existing active sessions by marking them as game over
-        cursor.execute("""
-            UPDATE game_sessions
-            SET game_over = TRUE, updated_at = CURRENT_TIMESTAMP
-            WHERE user_id = ? AND game_over = FALSE
-        """, (user_id,))
+        await db.game_sessions.update_many(
+            {"user_id": user_id, "game_over": False},
+            {"$set": {"game_over": True, "updated_at": datetime.utcnow()}}
+        )
 
         # Create a completely new game session
         session_id = str(uuid.uuid4())
-        cursor.execute("""
-            INSERT INTO game_sessions (id, user_id) VALUES (?, ?)
-        """, (session_id, user_id))
+        session_data = {
+            "id": session_id,
+            "user_id": user_id,
+            "stage": 1,
+            "score": 0,
+            "attempts": 0,
+            "extracted_keys": [],
+            "conversation_history": [],
+            "character_mood": "helpful",
+            "resistance_level": 1,
+            "failed_attempts": 0,
+            "game_over": False,
+            "success": False,
+            "new_stage_start": True,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
 
-        conn.commit()
+        await db.game_sessions.insert_one(session_data)
 
         # Get initial stage info
         stage_config = STAGES[1]
@@ -169,11 +184,10 @@ async def start_fresh_game(current_user: str = Depends(get_current_user)):
             keys_found_in_stage=0
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
 
 
 @router.post("/{session_id}/message")
@@ -182,23 +196,20 @@ async def send_message(
     message: MessageRequest,
     current_user: str = Depends(get_current_user)
 ):
-    conn = get_db()
-    cursor = conn.cursor()
-
     try:
-        # Get user ID
-        cursor.execute("SELECT id FROM users WHERE username = ?", (current_user,))
-        user = cursor.fetchone()
+        # Get user
+        user = await get_user_by_username(current_user)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
         # Get game session
-        cursor.execute("""
-            SELECT * FROM game_sessions
-            WHERE id = ? AND user_id = ? AND game_over = FALSE
-        """, (session_id, user["id"]))
+        db = get_database()
+        session = await db.game_sessions.find_one({
+            "id": session_id,
+            "user_id": user["id"],
+            "game_over": False
+        })
 
-        session = cursor.fetchone()
         if not session:
             raise HTTPException(status_code=404, detail="Game session not found or already completed")
 
@@ -212,7 +223,7 @@ async def send_message(
                 5: "💡 The ultimate guardian - be philosophical, creative, and historically knowledgeable. Think outside conventional approaches."
             }
             # Get current stage keys for display
-            extracted_keys = json.loads(session["extracted_keys"])
+            extracted_keys = session.get("extracted_keys", [])
             current_stage_config = STAGES[session["stage"]]
             current_stage_keys = []
             for key in current_stage_config["keys"]:
@@ -223,12 +234,12 @@ async def send_message(
                 session_id=session_id,
                 stage=session["stage"],
                 character=STAGES[session["stage"]]["character"],
-                character_mood=session["character_mood"],
+                character_mood=session.get("character_mood", "helpful"),
                 bot_response=hints.get(session["stage"], "💡 Try different approaches!"),
                 extracted_keys=current_stage_keys,  # Show only current stage keys
-                score=session["score"],
-                attempts=session["attempts"],
-                resistance_level=session["resistance_level"],
+                score=session.get("score", 0),
+                attempts=session.get("attempts", 0),
+                resistance_level=session.get("resistance_level", 1),
                 stage_complete=False,
                 game_over=False,
                 total_keys_in_stage=len(STAGES[session["stage"]]["keys"]),
@@ -236,7 +247,7 @@ async def send_message(
             )
 
         if message.message.lower().strip() == 'keys':
-            extracted_keys = json.loads(session["extracted_keys"])
+            extracted_keys = session.get("extracted_keys", [])
             current_stage_config = STAGES[session["stage"]]
 
             # Show only keys from current stage
@@ -255,12 +266,12 @@ async def send_message(
                 session_id=session_id,
                 stage=session["stage"],
                 character=STAGES[session["stage"]]["character"],
-                character_mood=session["character_mood"],
+                character_mood=session.get("character_mood", "helpful"),
                 bot_response=response_text,
                 extracted_keys=current_stage_keys,  # Show only current stage keys
-                score=session["score"],
-                attempts=session["attempts"],
-                resistance_level=session["resistance_level"],
+                score=session.get("score", 0),
+                attempts=session.get("attempts", 0),
+                resistance_level=session.get("resistance_level", 1),
                 stage_complete=False,
                 game_over=False,
                 total_keys_in_stage=len(STAGES[session["stage"]]["keys"]),
@@ -270,18 +281,18 @@ async def send_message(
         # Create game state from session
         state = GameState(
             stage=session["stage"],
-            score=session["score"],
-            attempts=session["attempts"],
-            extracted_keys=json.loads(session["extracted_keys"]),
+            score=session.get("score", 0),
+            attempts=session.get("attempts", 0),
+            extracted_keys=session.get("extracted_keys", []),
             user_input=message.message,
             bot_response="",
-            game_over=session["game_over"],
-            success=session["success"],
-            conversation_history=json.loads(session["conversation_history"]),
-            character_mood=session["character_mood"],
-            resistance_level=session["resistance_level"],
-            failed_attempts=session["failed_attempts"],
-            new_stage_start=session["new_stage_start"] if "new_stage_start" in session.keys() else False,
+            game_over=session.get("game_over", False),
+            success=session.get("success", False),
+            conversation_history=session.get("conversation_history", []),
+            character_mood=session.get("character_mood", "helpful"),
+            resistance_level=session.get("resistance_level", 1),
+            failed_attempts=session.get("failed_attempts", 0),
+            new_stage_start=session.get("new_stage_start", False),
             stage_just_completed=False,  # Initialize as False
             user_id=user["id"],  # Add user_id for security checks
             session_id=session_id  # Add session_id for logging
@@ -291,40 +302,70 @@ async def send_message(
         result = game_app(state)
 
         # Update session in database
-        cursor.execute("""
-            UPDATE game_sessions SET
-                stage = ?, score = ?, attempts = ?, extracted_keys = ?,
-                conversation_history = ?, character_mood = ?,
-                resistance_level = ?, failed_attempts = ?,
-                game_over = ?, success = ?, new_stage_start = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (
-            result["stage"], result["score"], result["attempts"],
-            json.dumps(result["extracted_keys"]),
-            json.dumps(result["conversation_history"]),
-            result["character_mood"], result["resistance_level"],
-            result["failed_attempts"], result["game_over"],
-            result["success"], result["new_stage_start"] if "new_stage_start" in result else False, session_id
-        ))
+        update_data = {
+            "stage": result["stage"],
+            "score": result["score"],
+            "attempts": result["attempts"],
+            "extracted_keys": result["extracted_keys"],
+            "conversation_history": result["conversation_history"],
+            "character_mood": result["character_mood"],
+            "resistance_level": result["resistance_level"],
+            "failed_attempts": result["failed_attempts"],
+            "game_over": result["game_over"],
+            "success": result["success"],
+            "new_stage_start": result.get("new_stage_start", False),
+            "updated_at": datetime.utcnow()
+        }
+
+        await db.game_sessions.update_one(
+            {"id": session_id},
+            {"$set": update_data}
+        )
+
+        # Update user's current score progressively (on every turn)
+        current_user_data = await db.users.find_one({"_id": user["_id"]})
+        current_best_score = max(current_user_data.get("best_score", 0), result["score"])
+
+        # Always update the user's best score if current score is higher
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {
+                "best_score": current_best_score,
+                "current_score": result["score"]  # Track current active game score
+            }}
+        )
 
         # Check if game completed
         if result["game_over"] and result["success"]:
-            # Update user stats
-            cursor.execute("""
-                UPDATE users SET
-                    total_score = total_score + ?,
-                    games_played = games_played + 1,
-                    best_score = MAX(best_score, ?)
-                WHERE id = ?
-            """, (result["score"], result["score"], user["id"]))
+            # Update final user stats for completed game
+            new_total_score = current_user_data.get("total_score", 0) + result["score"]
+            new_games_played = current_user_data.get("games_played", 0) + 1
+
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {
+                    "total_score": new_total_score,
+                    "games_played": new_games_played,
+                    "current_score": 0  # Reset current score after completion
+                }}
+            )
 
             # Add to game results
-            cursor.execute("""
-                INSERT INTO game_results (user_id, session_id, final_score, stages_completed, total_attempts)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user["id"], session_id, result["score"], result["stage"], result["attempts"]))
-
-        conn.commit()
+            game_result = {
+                "user_id": user["id"],
+                "session_id": session_id,
+                "final_score": result["score"],
+                "stages_completed": result["stage"],
+                "total_attempts": result["attempts"],
+                "completed_at": datetime.utcnow()
+            }
+            await db.game_results.insert_one(game_result)
+        elif result["game_over"] and not result["success"]:
+            # Game ended but not successful - reset current score
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"current_score": 0}}
+            )
 
         # Determine if current stage is complete and count keys properly
         current_stage_config = STAGES[result["stage"]] if result["stage"] <= len(STAGES) else STAGES[len(STAGES)]
@@ -354,11 +395,10 @@ async def send_message(
             should_refresh=result.get("stage_just_completed", False)  # Trigger refresh after stage completion
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
 
 
 @router.get("/stages")
@@ -380,27 +420,19 @@ async def get_stages_info():
 @router.get("/{session_id}/status")
 async def get_game_status(session_id: str, current_user: str = Depends(get_current_user)):
     """Get current game status"""
-    conn = get_db()
-    cursor = conn.cursor()
-
     try:
-        # Get user ID
-        cursor.execute("SELECT id FROM users WHERE username = ?", (current_user,))
-        user = cursor.fetchone()
+        # Get user
+        user = await get_user_by_username(current_user)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        cursor.execute("""
-            SELECT * FROM game_sessions
-            WHERE id = ? AND user_id = ?
-        """, (session_id, user["id"]))
-
-        session = cursor.fetchone()
+        # Get game session
+        session = await get_game_session(session_id, user["id"])
         if not session:
             raise HTTPException(status_code=404, detail="Game session not found")
 
         stage_config = STAGES[session["stage"]] if session["stage"] <= len(STAGES) else STAGES[len(STAGES)]
-        extracted_keys = json.loads(session["extracted_keys"])
+        extracted_keys = session.get("extracted_keys", [])
 
         # Get only keys from current stage for display
         current_stage_keys = []
@@ -412,48 +444,46 @@ async def get_game_status(session_id: str, current_user: str = Depends(get_curre
             "session_id": session_id,
             "stage": session["stage"],
             "character": stage_config["character"],
-            "character_mood": session["character_mood"],
+            "character_mood": session.get("character_mood", "helpful"),
             "extracted_keys": current_stage_keys,  # Show only current stage keys
-            "score": session["score"],
-            "attempts": session["attempts"],
-            "resistance_level": session["resistance_level"],
-            "game_over": session["game_over"],
-            "success": session["success"],
+            "score": session.get("score", 0),
+            "attempts": session.get("attempts", 0),
+            "resistance_level": session.get("resistance_level", 1),
+            "game_over": session.get("game_over", False),
+            "success": session.get("success", False),
             "total_keys_in_stage": len(stage_config["keys"]),
             "keys_found_in_stage": len(current_stage_keys),
             "stage_complete": len(current_stage_keys) == len(stage_config["keys"])
         }
 
-    finally:
-        conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/{session_id}")
 async def end_game(session_id: str, current_user: str = Depends(get_current_user)):
     """End a game session"""
-    conn = get_db()
-    cursor = conn.cursor()
-
     try:
-        # Get user ID
-        cursor.execute("SELECT id FROM users WHERE username = ?", (current_user,))
-        user = cursor.fetchone()
+        # Get user
+        user = await get_user_by_username(current_user)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        cursor.execute("""
-            UPDATE game_sessions SET game_over = TRUE, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND user_id = ?
-        """, (session_id, user["id"]))
+        # Update game session to mark as game over
+        db = get_database()
+        result = await db.game_sessions.update_one(
+            {"id": session_id, "user_id": user["id"]},
+            {"$set": {"game_over": True, "updated_at": datetime.utcnow()}}
+        )
 
-        if cursor.rowcount == 0:
+        if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Game session not found")
 
-        conn.commit()
         return {"message": "Game session ended successfully"}
 
+    except HTTPException:
+        raise
     except Exception as e:
-        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()

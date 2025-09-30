@@ -1,7 +1,11 @@
 import random
 import os
 import asyncio
+from dotenv import load_dotenv
 from openai import OpenAI
+
+# Load environment variables
+load_dotenv()
 
 from app.models.game_state import GameState
 from app.game.stages import STAGES
@@ -159,9 +163,15 @@ def character_ai_node(state: GameState):
         }
 
     except Exception as e:
+        print(f"ERROR in character_ai_node: {e}")
+        print(f"Error type: {type(e).__name__}")
+
+        # More detailed error message for debugging
+        error_msg = f"*CONNECTION ERROR* Please try again! System unstable... (Debug: {type(e).__name__})"
+
         return {
             **state,
-            "bot_response": f"*CONNECTION ERROR* Please try again! System unstable...",
+            "bot_response": error_msg,
             "attempts": state["attempts"] + 1,
             "new_stage_start": False  # Clear the flag if it was set
         }

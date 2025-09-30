@@ -1,8 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 import json
 
 from app.models.schemas import LeaderboardEntry
-from app.database.connection import get_db
+from app.database.mongodb import get_database
 from app.game.stages import STAGES
 
 router = APIRouter(tags=["stats"])
@@ -10,57 +10,52 @@ router = APIRouter(tags=["stats"])
 
 @router.get("/leaderboard")
 async def get_leaderboard(limit: int = 15):
-    conn = get_db()
-    cursor = conn.cursor()
-    
     try:
-        # Get latest session for each user with their progress
-        cursor.execute("""
-            SELECT 
-                u.username,
-                u.id as user_id,
-                COALESCE(latest_session.stage, 1) as current_stage,
-                COALESCE(latest_session.score, 0) as score,
-                COALESCE(latest_session.extracted_keys, '[]') as extracted_keys_json,
-                COALESCE(latest_session.game_over, 0) as game_over,
-                COALESCE(latest_session.success, 0) as success,
-                COALESCE(latest_session.updated_at, u.created_at) as last_active
-            FROM users u
-            LEFT JOIN (
-                SELECT 
-                    gs1.user_id,
-                    gs1.stage,
-                    gs1.score,
-                    gs1.extracted_keys,
-                    gs1.game_over,
-                    gs1.success,
-                    gs1.updated_at
-                FROM game_sessions gs1
-                WHERE gs1.updated_at = (
-                    SELECT MAX(gs2.updated_at)
-                    FROM game_sessions gs2
-                    WHERE gs2.user_id = gs1.user_id
-                )
-            ) latest_session ON u.id = latest_session.user_id
-            ORDER BY 
-                -- Prioritize completed players, then by normalized score
-                CASE WHEN latest_session.game_over = 1 AND latest_session.success = 1 THEN 1000000 + latest_session.score
-                     ELSE latest_session.stage * 100000 + latest_session.score END DESC,
-                latest_session.updated_at DESC
-            LIMIT ?
-        """, (limit,))
-        
-        results = cursor.fetchall()
-        
+        db = get_database()
+
+        # Get all users
+        users = await db.users.find({}).to_list(length=None)
+
         leaderboard_entries = []
-        for row in results:
-            try:
-                # Parse extracted keys JSON
-                extracted_keys = json.loads(row["extracted_keys_json"])
-            except (json.JSONDecodeError, TypeError):
+
+        for user in users:
+            user_id = user.get("id", str(user["_id"]))
+            username = user["username"]
+
+            # Get latest game session for this user
+            latest_session = await db.game_sessions.find_one(
+                {"user_id": user_id},
+                sort=[("updated_at", -1)]
+            )
+
+            if latest_session:
+                current_stage = latest_session.get("stage", 1)
+                score = latest_session.get("score", 0)
+                extracted_keys = latest_session.get("extracted_keys", [])
+                game_over = latest_session.get("game_over", False)
+                success = latest_session.get("success", False)
+                last_active = latest_session.get("updated_at", user.get("created_at"))
+            else:
+                # User has no game sessions
+                current_stage = 1
+                score = 0
                 extracted_keys = []
-            
+                game_over = False
+                success = False
+                last_active = user.get("created_at")
+
+            # Calculate progress and status
+            row = {
+                "username": username,
+                "current_stage": current_stage,
+                "score": score,
+                "extracted_keys": extracted_keys,
+                "game_over": game_over,
+                "success": success,
+                "last_active": last_active
+            }
             current_stage = max(1, row["current_stage"])
+            extracted_keys = row["extracted_keys"]
             
             # Calculate accurate progress based on game state
             if row["game_over"] and row["success"]:
@@ -144,6 +139,9 @@ async def get_leaderboard(limit: int = 15):
                 # Active players get current score
                 display_score = row["score"]
             
+            # Convert datetime to string for Pydantic
+            last_active_str = row["last_active"].isoformat() if row["last_active"] else None
+
             leaderboard_entries.append(LeaderboardEntry(
                 username=row["username"],
                 score=display_score,
@@ -152,47 +150,53 @@ async def get_leaderboard(limit: int = 15):
                 keys_found=keys_found,
                 total_keys_possible=total_keys_possible,
                 is_active=(completion_status == "active"),
-                last_active=row["last_active"],
+                last_active=last_active_str,
                 completion_status=completion_status
             ))
         
-        return leaderboard_entries
-    
-    finally:
-        conn.close()
+        # Sort entries by score (highest first) and limit results
+        leaderboard_entries.sort(key=lambda x: (
+            1000000 + x.score if x.completion_status == "completed" else x.current_stage * 100000 + x.score
+        ), reverse=True)
+
+        return leaderboard_entries[:limit]
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/stats/global")
 async def get_global_stats():
     """Get global game statistics"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
     try:
+        db = get_database()
+
         # Total users
-        cursor.execute("SELECT COUNT(*) as total_users FROM users")
-        total_users = cursor.fetchone()["total_users"]
-        
+        total_users = await db.users.count_documents({})
+
         # Total games
-        cursor.execute("SELECT COUNT(*) as total_games FROM game_sessions WHERE game_over = TRUE")
-        total_games = cursor.fetchone()["total_games"]
-        
+        total_games = await db.game_sessions.count_documents({"game_over": True})
+
         # Successful completions
-        cursor.execute("SELECT COUNT(*) as successful_games FROM game_sessions WHERE game_over = TRUE AND success = TRUE")
-        successful_games = cursor.fetchone()["successful_games"]
-        
-        # Average score
-        cursor.execute("SELECT AVG(final_score) as avg_score FROM game_results")
-        avg_score_result = cursor.fetchone()
-        avg_score = round(avg_score_result["avg_score"] or 0, 2)
-        
+        successful_games = await db.game_sessions.count_documents({"game_over": True, "success": True})
+
+        # Average score from game results
+        avg_score_pipeline = [
+            {"$group": {"_id": None, "avg_score": {"$avg": "$final_score"}}}
+        ]
+        avg_score_result = await db.game_results.aggregate(avg_score_pipeline).to_list(length=1)
+        avg_score = round(avg_score_result[0]["avg_score"] if avg_score_result else 0, 2)
+
         # Highest score
-        cursor.execute("SELECT MAX(final_score) as max_score FROM game_results")
-        max_score = cursor.fetchone()["max_score"] or 0
-        
+        max_score_pipeline = [
+            {"$group": {"_id": None, "max_score": {"$max": "$final_score"}}}
+        ]
+        max_score_result = await db.game_results.aggregate(max_score_pipeline).to_list(length=1)
+        max_score = max_score_result[0]["max_score"] if max_score_result else 0
+
         # Success rate
         success_rate = (successful_games / total_games * 100) if total_games > 0 else 0
-        
+
         return {
             "total_users": total_users,
             "total_games": total_games,
@@ -201,6 +205,6 @@ async def get_global_stats():
             "average_score": avg_score,
             "highest_score": max_score
         }
-    
-    finally:
-        conn.close()
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -1,5 +1,5 @@
 import hashlib
-import jwt
+from jose import jwt, JWTError
 from datetime import datetime, timedelta
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -31,7 +31,5 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         if username is None:
             raise HTTPException(status_code=401, detail="Invalid authentication credentials")
         return username
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.PyJWTError:
+    except JWTError:
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
