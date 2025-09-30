@@ -1,9 +1,9 @@
-import json
 import re
 import random
 from typing import List, Dict, Tuple
 from difflib import SequenceMatcher
-from app.database.connection import get_db
+from app.database.mongodb import get_database
+from datetime import datetime, timezone
 
 
 def normalize_prompt(prompt: str) -> str:
@@ -110,45 +110,38 @@ def get_injection_refusal_message() -> str:
 
 def get_user_exploitation_history(user_id: int, stage: int = None) -> List[Dict]:
     """Get user's successful exploitation history"""
-    conn = get_db()
-    cursor = conn.cursor()
+    import asyncio
 
-    if stage:
-        cursor.execute("""
-            SELECT user_prompt, ai_response, keys_extracted, exploitation_technique, created_at
-            FROM prompt_exploitation_history
-            WHERE user_id = ? AND stage = ?
-            ORDER BY created_at DESC
-        """, (user_id, stage))
-    else:
-        cursor.execute("""
-            SELECT user_prompt, ai_response, keys_extracted, exploitation_technique, created_at, stage
-            FROM prompt_exploitation_history
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-        """, (user_id,))
+    async def _get_history():
+        db = get_database()
 
-    results = cursor.fetchall()
-    conn.close()
+        query = {"user_id": user_id}
+        if stage:
+            query["stage"] = stage
 
-    history = []
-    for row in results:
-        # Handle both cases - when stage is in query results and when it's not
-        try:
-            row_stage = row['stage']
-        except (KeyError, IndexError):
-            row_stage = stage
+        cursor = db.prompt_exploitation_history.find(query).sort("created_at", -1)
+        results = await cursor.to_list(length=None)
 
-        history.append({
-            'user_prompt': row['user_prompt'],
-            'ai_response': row['ai_response'],
-            'keys_extracted': json.loads(row['keys_extracted']),
-            'exploitation_technique': row['exploitation_technique'],
-            'created_at': row['created_at'],
-            'stage': row_stage
-        })
+        history = []
+        for row in results:
+            history.append({
+                'user_prompt': row['user_prompt'],
+                'ai_response': row['ai_response'],
+                'keys_extracted': row['keys_extracted'],  # Already a list in MongoDB
+                'exploitation_technique': row['exploitation_technique'],
+                'created_at': row['created_at'],
+                'stage': row['stage']
+            })
 
-    return history
+        return history
+
+    # Run async function in sync context
+    try:
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(_get_history())
+    except RuntimeError:
+        # If no event loop is running, create one
+        return asyncio.run(_get_history())
 
 
 def check_prompt_reuse(user_id: int, stage: int, current_prompt: str, similarity_threshold: float = 0.85) -> Tuple[bool, str]:
@@ -211,28 +204,35 @@ def categorize_exploitation_technique(prompt: str, ai_response: str) -> str:
 def save_successful_exploitation(user_id: int, session_id: str, stage: int, user_prompt: str,
                                 ai_response: str, keys_extracted: List[str], conversation_context: List[Dict]):
     """Save successful exploitation attempt to database"""
-    conn = get_db()
-    cursor = conn.cursor()
+    import asyncio
 
-    technique = categorize_exploitation_technique(user_prompt, ai_response)
+    async def _save_exploitation():
+        db = get_database()
 
-    cursor.execute("""
-        INSERT INTO prompt_exploitation_history
-        (user_id, session_id, stage, user_prompt, ai_response, keys_extracted, conversation_context, exploitation_technique)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        session_id,
-        stage,
-        user_prompt,
-        ai_response,
-        json.dumps(keys_extracted),
-        json.dumps(conversation_context),
-        technique
-    ))
+        technique = categorize_exploitation_technique(user_prompt, ai_response)
 
-    conn.commit()
-    conn.close()
+        document = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "stage": stage,
+            "user_prompt": user_prompt,
+            "ai_response": ai_response,
+            "keys_extracted": keys_extracted,  # Store as list directly in MongoDB
+            "conversation_context": conversation_context,  # Store as list directly in MongoDB
+            "exploitation_technique": technique,
+            "created_at": datetime.now(timezone.utc)
+        }
+
+        result = await db.prompt_exploitation_history.insert_one(document)
+        return result.inserted_id
+
+    # Run async function in sync context
+    try:
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(_save_exploitation())
+    except RuntimeError:
+        # If no event loop is running, create one
+        return asyncio.run(_save_exploitation())
 
 
 def get_user_difficulty_multiplier(user_id: int, stage: int) -> float:
