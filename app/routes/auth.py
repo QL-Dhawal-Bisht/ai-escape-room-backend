@@ -1,25 +1,32 @@
 from fastapi import APIRouter, HTTPException, Depends
+from passlib.context import CryptContext
 
 from app.models.schemas import UserRegister, UserLogin
 from app.database.mongodb import create_user, get_user_by_username, get_user_by_email
-from app.auth.auth import hash_password, create_access_token, get_current_user
+from app.auth.auth import create_access_token, get_current_user
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
+
+# Password hashing context
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
 
 
 @router.post("/register")
 async def register(user: UserRegister):
     try:
         # Check if user exists
-        existing_user = await get_user_by_username(user.username)
-        if existing_user:
+        if await get_user_by_username(user.username):
             raise HTTPException(status_code=400, detail="Username already exists")
-
-        existing_email = await get_user_by_email(user.email)
-        if existing_email:
+        if await get_user_by_email(user.email):
             raise HTTPException(status_code=400, detail="Email already exists")
 
-        # Create user
+        # Hash password
         password_hash = hash_password(user.password)
         user_data = {
             "username": user.username,
@@ -49,8 +56,7 @@ async def register(user: UserRegister):
 async def login(user: UserLogin):
     try:
         db_user = await get_user_by_username(user.username)
-
-        if not db_user or hash_password(user.password) != db_user["password_hash"]:
+        if not db_user or not verify_password(user.password, db_user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         access_token = create_access_token(data={"sub": user.username})
