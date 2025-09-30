@@ -6,13 +6,32 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.config.settings import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
 
+try:
+    from passlib.context import CryptContext
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    USE_BCRYPT = True
+except ImportError:
+    USE_BCRYPT = False
 
 security = HTTPBearer()
 
 
 def hash_password(password: str) -> str:
-    """Hash password using SHA256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Hash password using bcrypt if available, otherwise SHA256"""
+    if USE_BCRYPT:
+        return pwd_context.hash(password)
+    else:
+        # Fallback to SHA256 for deployment environments without bcrypt
+        return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password using bcrypt if available, otherwise SHA256"""
+    if USE_BCRYPT:
+        return pwd_context.verify(plain_password, hashed_password)
+    else:
+        # Fallback to SHA256 comparison
+        return hashlib.sha256(plain_password.encode()).hexdigest() == hashed_password
 
 
 def create_access_token(data: dict):
